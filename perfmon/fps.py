@@ -132,12 +132,15 @@ class PresentMonFpsSource:
         self._proc: subprocess.Popen | None = None
         self._latest_t = 0.0                # последняя метка времени из CSV
         self._latest_arrival = time.perf_counter()
+        # Последние строки stderr PresentMon: именно там он объясняет, почему
+        # не смог стартовать («access denied» и т. п.)
+        self._stderr_tail: deque[str] = deque(maxlen=12)
+        self._strip_nulls = False
         self.error: str | None = None
 
         self._proc = self._spawn()
         if self._proc is None:
-            hint = "" if is_admin() else " (нужен запуск от администратора)"
-            raise RuntimeError(f"PresentMon не запустился{hint}")
+            raise RuntimeError(self._failure_reason())
 
         self._reader = threading.Thread(target=self._read_loop, daemon=True,
                                         name="presentmon-reader")
@@ -148,6 +151,26 @@ class PresentMonFpsSource:
             self._watcher.start()
 
     # -- запуск -------------------------------------------------------------
+    def _failure_reason(self) -> str:
+        """Внятное сообщение о том, почему PresentMon не поднялся."""
+        if self.error:
+            return f"PresentMon не запустился: {self.error}"
+        detail = " ".join(line for line in self._stderr_tail
+                          if line.lower().startswith("error")) or " ".join(self._stderr_tail)
+        if detail:
+            return f"PresentMon не запустился: {detail.strip()}"
+        if not is_admin():
+            return ("PresentMon не запустился: нужен запуск от администратора "
+                    "(ETW-сессия) или членство в группе «Performance Log Users»")
+        return "PresentMon не запустился и ничего не сообщил"
+
+    def _drain_stderr(self, pipe) -> None:
+        for raw in iter(pipe.readline, b""):
+            text = raw.decode("utf-8", "replace").strip()
+            if text:
+                self._stderr_tail.append(text)
+        pipe.close()
+
     def _spawn(self) -> subprocess.Popen | None:
         for args in self.ARG_SETS:
             if self._target_pid is not None:
@@ -158,46 +181,85 @@ class PresentMonFpsSource:
             try:
                 proc = subprocess.Popen(
                     [self.exe_path, *args],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
             except OSError as exc:
                 self.error = str(exc)
                 return None
 
+            # Постоянно вычитываем stderr: иначе он рано или поздно переполнится
+            # и заблокирует PresentMon, а так заодно видно причину отказа.
+            threading.Thread(target=self._drain_stderr, args=(proc.stderr,),
+                             daemon=True, name="presentmon-stderr").start()
+
             stream = io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace")
-            header = self._await_header(proc, stream, timeout=6.0)
+            header = self._await_header(proc, stream, timeout=8.0)
             if header is not None:
                 self._stream = stream
                 self._configure_columns(header)
                 return proc
 
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            self._kill(proc)
         return None
 
     @staticmethod
-    def _await_header(proc: subprocess.Popen, stream: io.TextIOWrapper,
+    def _kill(proc: subprocess.Popen) -> None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    def _await_header(self, proc: subprocess.Popen, stream: io.TextIOWrapper,
                       timeout: float) -> list[str] | None:
-        """Дождаться строки-заголовка CSV; None -- если процесс умер или молчит."""
-        deadline = time.perf_counter() + timeout
-        while time.perf_counter() < deadline:
-            if proc.poll() is not None:
-                return None
-            line = stream.readline()
-            if not line:
-                return None
-            if "ProcessID" in line:
-                return next(csv.reader([line.strip()]))
-        return None
+        """Дождаться строки-заголовка CSV; None -- если процесс умер или молчит.
+
+        ``readline()`` на трубе блокируется до конца строки, и проверка дедлайна
+        между вызовами тут не спасает: PresentMon может запуститься и молчать
+        (например, когда ETW-сессия зависла). Поэтому процесс убивается по
+        сторожевому таймеру -- труба закрывается, и readline возвращает пустую
+        строку.
+        """
+        watchdog = threading.Timer(timeout, self._kill, args=(proc,))
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            while True:
+                line = stream.readline()
+                if not line:
+                    return None
+                if "ProcessID" in line:
+                    return next(csv.reader([line.strip()]))
+                # При перенаправлении в файл PresentMon переключается в широкий
+                # режим CRT и пишет UTF-16LE. В трубу он этого не делает, но
+                # если вдруг сделает -- выкидываем нулевые байты и работаем дальше.
+                if "\x00" in line:
+                    stripped = line.replace("\x00", "")
+                    if "ProcessID" in stripped:
+                        self._strip_nulls = True
+                        return next(csv.reader([stripped.strip()]))
+        finally:
+            watchdog.cancel()
+
+    # Колонка с меткой времени называлась по-разному и мерялась в разных
+    # единицах: 1.x -- TimeInSeconds, ранние 2.x -- CPUStartTime, 2.5 -- TimeInMs
+    # и CPUStartTimeInMs. Порядок здесь -- порядок предпочтения.
+    TIME_COLUMNS = (
+        ("TimeInMs", 0.001),
+        ("CPUStartTimeInMs", 0.001),
+        ("TimeInSeconds", 1.0),
+        ("CPUStartTime", 1.0),
+    )
 
     def _configure_columns(self, header: list[str]) -> None:
         index = {name.strip(): position for position, name in enumerate(header)}
         self._col_pid = index.get("ProcessID")
-        # PresentMon 2.x -> CPUStartTime, 1.x -> TimeInSeconds
-        self._col_time = next((index[name] for name in ("CPUStartTime", "TimeInSeconds")
-                               if name in index), None)
+        self._col_time = None
+        self._time_scale = 1.0
+        for name, scale in self.TIME_COLUMNS:
+            if name in index:
+                self._col_time = index[name]
+                self._time_scale = scale
+                break
         self._col_dropped = index.get("Dropped")
 
     # -- фоновые потоки -----------------------------------------------------
@@ -217,6 +279,7 @@ class PresentMonFpsSource:
         col_pid = self._col_pid
         col_time = self._col_time
         col_dropped = self._col_dropped
+        scale = self._time_scale
         if col_pid is None:
             return
         min_columns = max(index for index in (col_pid, col_time, col_dropped)
@@ -228,7 +291,11 @@ class PresentMonFpsSource:
         clock = time.perf_counter
         stopped = self._stop.is_set
 
-        for row in csv.reader(self._stream):
+        source = self._stream
+        if self._strip_nulls:
+            source = (line.replace("\x00", "") for line in self._stream)
+
+        for row in csv.reader(source):
             if len(row) < min_columns:
                 continue
             if row[col_pid] != self._pid_text:
@@ -239,10 +306,12 @@ class PresentMonFpsSource:
             now = clock()
             if col_time is not None:
                 try:
-                    timestamp = float(row[col_time])
+                    timestamp = float(row[col_time]) * scale
                 except ValueError:
-                    timestamp = now
+                    continue  # «NA» -- шкалы смешивать нельзя, строку пропускаем
             else:
+                # Формат незнакомый: берём время получения строки. Само по себе
+                # это согласовано, просто чуть менее точно.
                 timestamp = now
 
             with lock:

@@ -60,6 +60,7 @@ includes = ["perfmon"]
 
 [tool.pdm.scripts]
 start = { cmd = "python main.py", help = "Запустить оверлей" }
+admin = { cmd = "python main.py --elevate", help = "Запустить с повышением прав (нужно для FPS)" }
 demo = { cmd = "python main.py --fps demo", help = "Запустить с псевдо-FPS, без PresentMon" }
 bench = { cmd = "python -m perfmon.bench", help = "Замерить стоимость сбора метрик и отрисовки" }
 lint = { cmd = "ruff check perfmon main.py", help = "Проверить стиль" }

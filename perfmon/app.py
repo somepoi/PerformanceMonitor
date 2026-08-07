@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -13,7 +16,7 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-from .fps import FpsStats, open_fps_source
+from .fps import FpsStats, is_admin, open_fps_source
 from .overlay import OverlayWidget
 from .sources import MetricsCollector, Snapshot
 
@@ -119,7 +122,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--priority", default="normal",
                         choices=("normal", "below", "idle"),
                         help="приоритет процесса: below/idle уступают ЦП игре")
+    parser.add_argument("--elevate", action="store_true",
+                        help="перезапуститься от администратора (нужно PresentMon для ETW)")
     return parser
+
+
+def _relaunch_elevated() -> bool:
+    """Перезапустить себя через UAC. True -- новый процесс запущен.
+
+    PresentMon поднимает ETW-сессию, а это требует прав администратора. Чтобы
+    не открывать каждый раз отдельный терминал, монитор умеет перезапустить сам
+    себя: пользователь подтверждает один запрос UAC.
+    """
+    rest = [arg for arg in sys.argv[1:] if arg != "--elevate"]
+    entry = sys.argv[0]
+    if entry.lower().endswith(".py"):
+        program = sys.executable                      # python.exe main.py ...
+        params = subprocess.list2cmdline([os.path.abspath(entry), *rest])
+    else:
+        program = os.path.abspath(entry)              # performance-monitor.exe ...
+        params = subprocess.list2cmdline(rest)
+
+    SW_SHOWNORMAL = 1
+    shell32 = ctypes.WinDLL("shell32.dll")
+    shell32.ShellExecuteW.restype = ctypes.c_void_p
+    result = shell32.ShellExecuteW(None, "runas", program, params,
+                                   os.getcwd(), SW_SHOWNORMAL)
+    # ShellExecuteW возвращает <= 32 при ошибке; 5 -- пользователь отказал в UAC
+    return int(result or 0) > 32
 
 
 def _force_utf8(stream) -> None:
@@ -152,6 +182,14 @@ def run(argv: list | None = None) -> int:
     _force_utf8(sys.stdout)
     _force_utf8(sys.stderr)
 
+    if args.elevate and not is_admin():
+        if _relaunch_elevated():
+            print("Перезапущено с правами администратора.")
+            return 0
+        print("Перезапуск от администратора не состоялся (запрос UAC отклонён?).",
+              file=sys.stderr)
+        return 1
+
     app = QApplication(sys.argv[:1])
     app.setQuitOnLastWindowClosed(False)
 
@@ -159,8 +197,12 @@ def run(argv: list | None = None) -> int:
         fps_source, fps_note = open_fps_source(args.fps, args.presentmon, args.fps_pid)
     except Exception as exc:
         print(f"Источник FPS недоступен: {exc}", file=sys.stderr)
-        print("Подсказка: скачайте PresentMon и положите его рядом с main.py, "
-              "либо запустите с --fps demo / --fps off.", file=sys.stderr)
+        if not is_admin():
+            print("Подсказка: PresentMon поднимает ETW-сессию, для этого нужен "
+                  "запуск от администратора.", file=sys.stderr)
+        else:
+            print("Подсказка: положите PresentMon.exe рядом с main.py или в tools\\, "
+                  "либо запустите с --fps demo / --fps off.", file=sys.stderr)
         return 1
     _apply_priority(args.priority)
 

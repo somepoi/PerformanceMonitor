@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 # Стандартные места установки LibreHardwareMonitor
 _DLL_CANDIDATES = (
@@ -38,6 +40,23 @@ class LhmReading:
     gpu_vram_total: float | None = None  # МБ
 
 
+def _cpu_temp_rank(name: str) -> int:
+    """Насколько датчик подходит на роль «температуры ЦП».
+
+    У AMD Zen рядом живут ``Core (Tctl/Tdie)`` -- общая температура пакета -- и
+    ``CCD1 (Tdie)`` / ``CCD2 (Tdie)`` по кристаллам. Брать последний встреченный
+    нельзя: CCD перезатирает пакет и занижает показание. У Intel роль пакета
+    играет ``CPU Package``.
+    """
+    if "Package" in name or "Tctl" in name:
+        return 3
+    if "Tdie" in name:
+        return 2
+    if name.startswith("CPU Core"):
+        return 1
+    return 0
+
+
 def _find_dll(explicit: str | None = None) -> str | None:
     paths = []
     if explicit:
@@ -57,6 +76,33 @@ def _find_dll(explicit: str | None = None) -> str | None:
 class LhmLibrarySource:
     """Прямая загрузка LibreHardwareMonitorLib.dll через pythonnet."""
 
+    # Ссылки на обработчики AssemblyResolve храним сами: если их соберёт сборщик
+    # мусора Python, .NET останется с висящим делегатом
+    _resolvers: ClassVar[list] = []
+
+    @staticmethod
+    def _install_resolver(directory: str) -> None:
+        """Научить .NET искать зависимые сборки рядом с основной DLL.
+
+        ``LibreHardwareMonitorLib`` тянет HidSharp, RAMSPDToolkit и несколько
+        System.*-сборок. Стандартный поиск .NET идёт от каталога приложения --
+        то есть от ``python.exe``, а не от нашего ``lib\\``. Без этого
+        обработчика библиотека грузится, но падает при обращении к датчикам.
+        """
+        from System import AppDomain, ResolveEventHandler  # type: ignore
+        from System.Reflection import Assembly  # type: ignore
+
+        def resolve(_sender, event):
+            name = str(event.Name).split(",")[0]
+            candidate = os.path.join(directory, name + ".dll")
+            if os.path.isfile(candidate):
+                return Assembly.LoadFrom(candidate)
+            return None
+
+        handler = ResolveEventHandler(resolve)
+        LhmLibrarySource._resolvers.append(handler)
+        AppDomain.CurrentDomain.AssemblyResolve += handler
+
     def __init__(self, dll_path: str | None = None) -> None:
         path = _find_dll(dll_path)
         if path is None:
@@ -68,6 +114,7 @@ class LhmLibrarySource:
         directory = os.path.dirname(path)
         if directory not in _sys.path:
             _sys.path.append(directory)
+        self._install_resolver(directory)
         clr.AddReference(path[:-4] if path.lower().endswith(".dll") else path)
 
         from LibreHardwareMonitor.Hardware import Computer  # type: ignore
@@ -82,8 +129,7 @@ class LhmLibrarySource:
 
     def read(self) -> LhmReading:
         out = LhmReading()
-        cpu_package: float | None = None
-        cpu_core_temps: list[float] = []
+        best_temp: tuple[int, float] | None = None  # (приоритет, значение)
 
         for hardware in self._computer.Hardware:
             hardware.Update()
@@ -99,11 +145,17 @@ class LhmLibrarySource:
                     if value is None:
                         continue
                     if stype == "Temperature":
-                        if "Package" in name or "Tctl" in name or "Tdie" in name:
-                            cpu_package = float(value)
-                        elif name.startswith("CPU Core"):
-                            cpu_core_temps.append(float(value))
-                    elif stype == "Clock" and name.startswith("CPU Core"):
+                        # Без прав администратора драйвер датчиков не грузится,
+                        # и LHM отдаёт нули вместо отсутствующих значений.
+                        # Ноль градусов у работающего ЦП невозможен.
+                        if value <= 0:
+                            continue
+                        rank = _cpu_temp_rank(name)
+                        if rank and (best_temp is None or rank > best_temp[0]
+                                     or (rank == best_temp[0] and value > best_temp[1])):
+                            best_temp = (rank, float(value))
+                    elif stype == "Clock" and name.startswith("Core #") \
+                            and "Effective" not in name:
                         out.cpu_core_clocks.append(float(value))
 
             elif kind.startswith("Gpu"):
@@ -114,8 +166,9 @@ class LhmLibrarySource:
                     value = sensor.Value
                     if value is None:
                         continue
-                    if stype == "Temperature" and "Core" in name:
-                        out.gpu_temp = float(value)
+                    if stype == "Temperature" and name == "GPU Core":
+                        if value > 0:
+                            out.gpu_temp = float(value)
                     elif stype == "Load" and name in ("GPU Core", "D3D 3D"):
                         if out.gpu_load is None or name == "GPU Core":
                             out.gpu_load = float(value)
@@ -126,8 +179,7 @@ class LhmLibrarySource:
                         elif name == "GPU Memory Total":
                             out.gpu_vram_total = float(value)
 
-        out.cpu_temp = cpu_package if cpu_package is not None else (
-            max(cpu_core_temps) if cpu_core_temps else None)
+        out.cpu_temp = best_temp[1] if best_temp else None
         return out
 
     def close(self) -> None:
@@ -143,7 +195,12 @@ class LhmWmiSource:
     NAMESPACES = (r"root\LibreHardwareMonitor", r"root\OpenHardwareMonitor")
 
     def __init__(self) -> None:
-        import wmi  # type: ignore
+        # Пакет wmi содержит невалидные escape-последовательности в docstring'ах
+        # и на Python 3.12+ сыплет SyntaxWarning при первом импорте. Это его
+        # проблема, а не наша -- не засоряем ей вывод.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            import wmi  # type: ignore
 
         self._conn = None
         last_error: Exception | None = None
@@ -161,8 +218,7 @@ class LhmWmiSource:
 
     def read(self) -> LhmReading:
         out = LhmReading()
-        cpu_package: float | None = None
-        cpu_core_temps: list[float] = []
+        best_temp: tuple[int, float] | None = None
 
         for sensor in self._conn.Sensor():
             name = sensor.Name or ""
@@ -175,14 +231,17 @@ class LhmWmiSource:
 
             is_gpu = "/gpu" in ident or "amdgpu" in ident or "nvidiagpu" in ident
             if stype == "Temperature":
-                if is_gpu and "Core" in name:
+                if value <= 0:      # см. комментарий в LhmLibrarySource.read
+                    continue
+                if is_gpu and name == "GPU Core":
                     out.gpu_temp = value
                 elif "/cpu" in ident:
-                    if "Package" in name or "Tctl" in name or "Tdie" in name:
-                        cpu_package = value
-                    elif name.startswith("CPU Core"):
-                        cpu_core_temps.append(value)
-            elif stype == "Clock" and "/cpu" in ident and name.startswith("CPU Core"):
+                    rank = _cpu_temp_rank(name)
+                    if rank and (best_temp is None or rank > best_temp[0]
+                                 or (rank == best_temp[0] and value > best_temp[1])):
+                        best_temp = (rank, value)
+            elif (stype == "Clock" and "/cpu" in ident
+                  and name.startswith("Core #") and "Effective" not in name):
                 out.cpu_core_clocks.append(value)
             elif stype == "Load" and is_gpu and name == "GPU Core":
                 out.gpu_load = value
@@ -192,8 +251,7 @@ class LhmWmiSource:
                 elif name == "GPU Memory Total":
                     out.gpu_vram_total = value
 
-        out.cpu_temp = cpu_package if cpu_package is not None else (
-            max(cpu_core_temps) if cpu_core_temps else None)
+        out.cpu_temp = best_temp[1] if best_temp else None
         return out
 
     def close(self) -> None:
