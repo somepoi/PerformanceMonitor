@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# PDM
+.pdm-python
+.pdm-build/
+.venv/
+__pypackages__/
+
+# Внешние бинарники, которые кладутся вручную
+PresentMon*.exe
+tools/
+lib/
