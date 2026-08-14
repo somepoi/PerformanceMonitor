@@ -1,6 +1,6 @@
 """FPS из RivaTuner Statistics Server.
 
-RTSS перехватывает вызовы представления кадра в самой игре и публикует
+RTSS перехватывает вызовы представления кадра внутри самой игры и публикует
 результат в общей памяти ``RTSSSharedMemoryV2``. Это тот же источник, из
 которого рисует свой оверлей MSI Afterburner, так что цифры сходятся с
 привычными один в один.
@@ -9,6 +9,17 @@ RTSS перехватывает вызовы представления кадр
 записи берётся из заголовка (``dwAppEntrySize``), поэтому читать по фиксированным
 смещениям можно только начало структуры -- зато оно неизменно во всех версиях
 2.x, и всё нужное лежит именно там.
+
+Считается FPS по окну усреднения самого RTSS: ``dwFrames`` кадров за
+``dwTime1 - dwTime0`` миллисекунд. Это единственные данные, на которые можно
+опираться:
+
+* ``dwFrameTime`` -- НЕ интервал между кадрами. Замер на Cyberpunk 2077 при
+  эталонных 228 FPS (то есть 4380 мкс на кадр) даёт 270-900 мкс: это время
+  внутри вызова Present, а не время кадра. По нему FPS завышается в разы;
+* ``dwStatFramerateMin/Avg/Max`` и буфер ``dwStatFrameTimeBuf`` заполняются,
+  только когда в RTSS запущен сбор статистики. По умолчанию ``dwStatFlags``
+  равен нулю, а буфер пуст.
 """
 
 from __future__ import annotations
@@ -43,14 +54,15 @@ APP_FLAGS = 0x108
 APP_TIME0 = 0x10C       # начало окна усреднения, мс
 APP_TIME1 = 0x110       # конец окна усреднения, мс
 APP_FRAMES = 0x114      # кадров за окно
-APP_FRAME_TIME = 0x118  # время последнего кадра, мкс
 
-WINDOW_SECONDS = 1.0
-BUCKET_SECONDS = 0.1
-SAMPLE_SECONDS = 0.01     # опрос времени кадра -- 100 Гц
+POLL_SECONDS = 0.05       # как часто проверять, не сменилось ли окно RTSS
 RESOLVE_SECONDS = 0.5     # как часто пересматривать, чьи кадры считаем
+HISTORY_SECONDS = 120.0   # сколько показаний храним
+MIN_WINDOW = 1.0          # минимальное окно для минимума/максимума, с
+WINDOW_PERIODS = 3        # или столько периодов обновления RTSS -- что больше
+MAX_WINDOW = 6.0
 RECONNECT_SECONDS = 5.0   # пауза перед повторной попыткой открыть память
-STALE_SECONDS = 15.0      # столько тишины -- и переоткрываем отображение
+STALE_SECONDS = 30.0      # столько тишины -- и переоткрываем отображение
 
 
 @dataclass
@@ -88,7 +100,7 @@ class AppEntry:
     @property
     def average_fps(self) -> float | None:
         span = self.time1 - self.time0
-        return (self.frames * 1000.0 / span) if span > 0 else None
+        return (self.frames * 1000.0 / span) if span > 0 and self.frames else None
 
 
 class RtssFpsSource:
@@ -105,11 +117,11 @@ class RtssFpsSource:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._current_offset: int | None = None
-        self._current_pid = 0
         self._current_name = ""
-        self._average: float | None = None
-        # (момент опроса, время кадра в мкс)
-        self._samples: deque[tuple[float, int]] = deque(maxlen=4096)
+        self._last_window: tuple[int, int] | None = None
+        # (момент получения, FPS за окно RTSS)
+        self._samples: deque[tuple[float, float]] = deque()
+        self._period = MIN_WINDOW          # наблюдаемый период обновления RTSS
         self._last_alive = time.perf_counter()
         self._next_attempt = 0.0
 
@@ -145,8 +157,8 @@ class RtssFpsSource:
             self._shm = None
         with self._lock:
             self._current_offset = None
+            self._last_window = None
             self._samples.clear()
-            self._average = None
 
     @property
     def connected(self) -> bool:
@@ -155,6 +167,11 @@ class RtssFpsSource:
     @property
     def version_text(self) -> str:
         return f"{self.version >> 16}.{self.version & 0xFFFF}"
+
+    @property
+    def update_period(self) -> float:
+        """Наблюдаемый период обновления статистики RTSS, с."""
+        return self._period
 
     # -- разбор записей -----------------------------------------------------
     def entries(self) -> list[AppEntry]:
@@ -181,28 +198,50 @@ class RtssFpsSource:
     def _select(self) -> AppEntry | None:
         """Чьи кадры показываем.
 
-        Сначала процесс активного окна -- так строка отражает то, во что играют.
-        Если активное окно RTSS не отслеживает (свернулись в браузер), берём
-        последнее обновлявшееся приложение: показания игры остаются на экране,
-        а не обнуляются при alt-tab.
+        RTSS держит записи и для обычных программ -- мессенджеров, оверлея
+        Steam, -- но кадров в них нет. Поэтому среди приложений активного окна
+        нас интересуют только те, что действительно выводят кадры; иначе
+        показания игры пропадали бы, стоит навести фокус на любое окно рядом.
         """
-        found = self.entries()
-        if not found:
+        live = [entry for entry in self.entries() if entry.average_fps]
+        if not live:
             return None
         if self._target_pid is not None:
-            for entry in found:
-                if entry.process_id == self._target_pid:
-                    return entry
-            return None
+            return next((e for e in live if e.process_id == self._target_pid), None)
 
         active = foreground_pid()
-        for entry in found:
+        for entry in live:
             if entry.process_id == active:
                 return entry
-        live = [entry for entry in found if entry.frames]
-        return max(live, key=lambda e: e.time1) if live else None
+        # Активное окно кадров не выводит -- держим последнюю живую игру, чтобы
+        # значения не обнулялись при alt-tab
+        return max(live, key=lambda e: e.time1)
 
     # -- фоновый опрос ------------------------------------------------------
+    def _record(self, entry: AppEntry, now: float) -> None:
+        """Запомнить показание, если RTSS закрыл новое окно усреднения."""
+        window = (entry.time0, entry.time1)
+        if window == self._last_window:
+            return
+        fps = entry.average_fps
+        if fps is None:
+            return
+
+        with self._lock:
+            if self._last_window is not None and self._samples:
+                # Период обновления RTSS настраивается пользователем (по
+                # умолчанию 1000 мс). Замеряем его сами, чтобы знать, за сколько
+                # секунд вообще можно посчитать минимум и максимум.
+                gap = now - self._samples[-1][0]
+                if 0.02 <= gap <= 5.0:
+                    self._period = self._period * 0.7 + gap * 0.3
+            self._last_window = window
+            self._samples.append((now, fps))
+            horizon = now - HISTORY_SECONDS
+            while self._samples and self._samples[0][0] < horizon:
+                self._samples.popleft()
+        self._last_alive = now
+
     def _run(self) -> None:
         next_resolve = 0.0
         while not self._stop.is_set():
@@ -217,73 +256,55 @@ class RtssFpsSource:
             if now >= next_resolve:
                 next_resolve = now + RESOLVE_SECONDS
                 entry = self._select()
-                with self._lock:
-                    if entry is None:
+                if entry is None:
+                    with self._lock:
                         self._current_offset = None
-                        self._current_pid = 0
                         self._current_name = ""
-                        self._average = None
-                    else:
-                        if entry.offset != self._current_offset:
-                            self._samples.clear()
+                elif entry.offset != self._current_offset:
+                    with self._lock:
                         self._current_offset = entry.offset
-                        self._current_pid = entry.process_id
                         self._current_name = entry.name
-                        self._average = entry.average_fps
-                        if entry.frames:
-                            self._last_alive = now
+                        self._last_window = None
+                        self._samples.clear()
 
-                # Долгая тишина может означать и «никто не играет», и то, что RTSS
-                # перезапустился, а мы держим отображение старой, уже мёртвой
-                # области. Переоткрыть дёшево, поэтому просто переоткрываем.
+                # Долгая тишина может означать и «никто не играет», и то, что
+                # RTSS перезапустился, а мы держим отображение старой, уже
+                # мёртвой области. Переоткрыть дёшево, поэтому переоткрываем.
                 if now - self._last_alive > STALE_SECONDS:
                     self._disconnect()
                     self._last_alive = now
                     continue
 
             offset = self._current_offset
-            if offset is not None and self._shm is not None:
-                frame_time = self._shm.u32(offset + APP_FRAME_TIME)
-                if frame_time:
-                    with self._lock:
-                        self._samples.append((now, frame_time))
-                        horizon = now - 2.0
-                        while self._samples and self._samples[0][0] < horizon:
-                            self._samples.popleft()
+            shm = self._shm
+            if offset is not None and shm is not None:
+                self._record(AppEntry(
+                    index=-1, offset=offset, process_id=0, name="",
+                    time0=shm.u32(offset + APP_TIME0),
+                    time1=shm.u32(offset + APP_TIME1),
+                    frames=shm.u32(offset + APP_FRAMES)), now)
 
-            self._stop.wait(SAMPLE_SECONDS)
+            self._stop.wait(POLL_SECONDS)
 
     # -- показания ----------------------------------------------------------
     def stats(self) -> FpsStats:
         with self._lock:
-            average = self._average
-            if self._current_offset is None:
+            if self._current_offset is None or not self._samples:
                 return FpsStats()
             now = time.perf_counter()
-            start = now - WINDOW_SECONDS
-            window = [(t, ft) for t, ft in self._samples if t >= start]
+            current = self._samples[-1][1]
+            # Минимум и максимум -- за последнюю секунду. Но если RTSS обновляет
+            # статистику раз в секунду (значение по умолчанию), в это окно
+            # попадёт единственное показание. Тогда окно расширяется до трёх
+            # периодов обновления -- иначе стрелочки просто дублировали бы
+            # текущее значение и ничего не сообщали.
+            span = min(MAX_WINDOW, max(MIN_WINDOW, self._period * WINDOW_PERIODS))
+            start = now - span
+            window = [fps for moment, fps in self._samples if moment >= start]
 
         if not window:
-            return FpsStats(current=0.0, minimum=0.0, maximum=0.0)
-
-        # Текущее значение -- собственное окно усреднения RTSS: ровно то, что
-        # показывает оверлей Afterburner. Если оно ещё не заполнено, считаем сами.
-        if average is None:
-            average = 1_000_000.0 / (sum(ft for _, ft in window) / len(window))
-
-        # Минимум и максимум -- по корзинам в 100 мс. По отдельным кадрам они
-        # скачут так, что читать невозможно, а по целой секунде теряют просадки.
-        bucket_count = round(WINDOW_SECONDS / BUCKET_SECONDS)
-        buckets: list[list[int]] = [[] for _ in range(bucket_count)]
-        for moment, frame_time in window:
-            index = int((moment - start) / BUCKET_SECONDS)
-            if 0 <= index < bucket_count:
-                buckets[index].append(frame_time)
-        rates = [1_000_000.0 * len(values) / sum(values)
-                 for values in buckets if values]
-        if not rates:
-            return FpsStats(current=average, minimum=average, maximum=average)
-        return FpsStats(current=average, minimum=min(rates), maximum=max(rates))
+            return FpsStats(current=current, minimum=current, maximum=current)
+        return FpsStats(current=current, minimum=min(window), maximum=max(window))
 
     @property
     def application(self) -> str:

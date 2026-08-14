@@ -102,7 +102,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--priority", default="normal",
                         choices=("normal", "below", "idle"),
                         help="приоритет процесса: below/idle уступают ЦП игре")
+    parser.add_argument("--list-sensors", action="store_true",
+                        help="напечатать все датчики Afterburner и выйти "
+                             "(для разбора, чего не хватает на конкретной машине)")
     return parser
+
+
+def _list_sensors() -> int:
+    """Выгрузка всех источников Afterburner -- диагностика чужой машины."""
+    from .afterburner import open_afterburner
+    from .sources import logical_processor_count
+
+    hardware, note = open_afterburner()
+    print(note)
+    if not hardware.connected:
+        return 1
+    print(f"логических процессоров в системе: {logical_processor_count()}")
+    print(f"ядер отдаёт Afterburner: {hardware.core_count}")
+    print(f"{'источник':<28} {'значение':>12}  {'ед.':<6} ГП")
+    for name, value, units, gpu in hardware.list_sensors():
+        print(f"{name:<28} {value:12.2f}  {units:<6} {gpu}")
+    hardware.close()
+    return 0
 
 
 def _force_utf8(stream) -> None:
@@ -135,6 +156,9 @@ def run(argv: list | None = None) -> int:
     # Консоль или файл могут быть в cp866 -- там нет ни «°», ни «│»
     _force_utf8(sys.stdout)
     _force_utf8(sys.stderr)
+
+    if args.list_sensors:
+        return _list_sensors()
 
     app = QApplication(sys.argv[:1])
     app.setQuitOnLastWindowClosed(False)

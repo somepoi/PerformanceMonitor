@@ -27,6 +27,7 @@ C_GRAPH_BG = QColor(255, 255, 255, 22)
 C_GRAPH_LINE = QColor(255, 82, 82)     # красная -- текущий FPS
 C_GRAPH_AVG = QColor(76, 200, 90)      # зелёная -- среднее за 90 с
 C_CORE = QColor(76, 200, 90)
+C_CORE_IDLE = QColor(76, 200, 90, 120)   # основание простаивающего ядра
 C_CORE_BG = QColor(255, 255, 255, 18)
 
 DASH = "--"
@@ -154,12 +155,35 @@ class OverlayWidget(QWidget):
         """Единица измерения: мелко и прижата к верхнему краю строки."""
         self._draw_text(cursor, text, self.font_small, self.fm_small, C_UNIT,
                         self.BAND_UNIT, None, Qt.AlignmentFlag.AlignLeft)
-        cursor.x += self.GAP_S * 0.5  # чтобы единица не слипалась со следующим числом
 
-    def _mark(self, cursor: _Cursor, text: str) -> None:
-        """Стрелочка-пометка (↑ / ↓) перед значением."""
-        self._draw_text(cursor, text, self.font_small, self.fm_small, C_MARK,
-                        self.BAND_VALUE, None, Qt.AlignmentFlag.AlignLeft)
+    def _marked(self, cursor: _Cursor, mark: str, text: str, cells: int) -> None:
+        """Стрелочка вплотную к своему значению.
+
+        Числовые поля занимают фиксированное число знакомест, иначе строка
+        дёргалась бы при смене разрядности. Но если прижимать вправо только
+        число, свободное знакоместо оказывается между стрелкой и числом:
+        ``46 ↑ 66`` против ``46 ↑221``. Поэтому вправо прижимается пара
+        целиком, а запас уходит влево, где и так стоит отступ.
+        """
+        mark_width = self.fm_small.horizontalAdvance(mark)
+        total = self.cell_value * cells + mark_width
+        painter = cursor.painter
+        if painter is not None:
+            right = cursor.x + total
+            number_width = self.cell_value * len(text)
+            painter.setFont(self.font_value)
+            painter.setPen(C_VALUE)
+            painter.drawText(self._band(self.BAND_VALUE, right - number_width,
+                                        number_width),
+                             Qt.AlignmentFlag.AlignRight
+                             | Qt.AlignmentFlag.AlignVCenter, text)
+            painter.setFont(self.font_small)
+            painter.setPen(C_MARK)
+            painter.drawText(
+                self._band(self.BAND_VALUE, right - number_width - mark_width,
+                           mark_width),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, mark)
+        cursor.x += total
 
     def _separator(self, cursor: _Cursor) -> None:
         cursor.x += self.GAP
@@ -242,14 +266,18 @@ class OverlayWidget(QWidget):
         if painter is not None:
             painter.fillRect(rect, C_CORE_BG)
             bar_width = max(1.0, self.CORE_STEP - 1.0)
+            # Столбик простаивающего ядра короче пикселя и не рисуется вовсе,
+            # из-за чего график читается как «ядер всего четыре». Поэтому у
+            # каждого ядра есть основание в один пиксель: количество ядер видно
+            # всегда, а разница между простоем и нагрузкой -- по высоте.
+            floor_height = max(1.0, round(self.scale_factor))
             for index, load in enumerate(cores):
                 ratio = max(0.0, min(1.0, load / 100.0))
-                bar_height = ratio * rect.height()
-                if bar_height <= 0.0:
-                    continue
+                bar_height = max(floor_height, ratio * rect.height())
                 bar = QRectF(rect.left() + index * self.CORE_STEP,
                              rect.bottom() - bar_height, bar_width, bar_height)
-                painter.fillRect(bar, C_CORE)
+                painter.fillRect(bar, C_CORE_IDLE if ratio * rect.height()
+                                 < floor_height else C_CORE)
         cursor.x += width
 
     # -- сборка строки ------------------------------------------------------
@@ -263,16 +291,19 @@ class OverlayWidget(QWidget):
         def number(value: float | None, digits: int = 0) -> str:
             return DASH if value is None else f"{value:.{digits}f}"
 
+        # Внутри одной величины -- узкий отступ, между разными величинами --
+        # широкий: так глаз сразу видит, что «46 ↑66 %» это одно, а «4.89 ↑4.90
+        # ГГц» -- другое.
+        tight, wide = self.GAP_S, self.GAP
+
         # --- FPS ---
         self._label(cursor, "FPS", C_FPS)
-        cursor.x += self.GAP_S
+        cursor.x += tight
         self._value(cursor, number(fps.current), 3)
-        cursor.x += self.GAP_S
-        self._mark(cursor, ARROW_DOWN)
-        self._value(cursor, number(fps.minimum), 3)
-        cursor.x += self.GAP_S
-        self._mark(cursor, ARROW_UP)
-        self._value(cursor, number(fps.maximum), 3)
+        cursor.x += tight
+        self._marked(cursor, ARROW_DOWN, number(fps.minimum), 3)
+        cursor.x += tight
+        self._marked(cursor, ARROW_UP, number(fps.maximum), 3)
 
         self._separator(cursor)
         self._draw_fps_graph(cursor)
@@ -280,22 +311,20 @@ class OverlayWidget(QWidget):
 
         # --- ЦП ---
         self._label(cursor, "CPU", C_CPU)
-        cursor.x += self.GAP_S
+        cursor.x += tight
         self._value(cursor, number(cpu.load_avg), 3)
-        cursor.x += self.GAP_S
-        self._mark(cursor, ARROW_UP)
-        self._value(cursor, number(cpu.load_max), 3)
+        cursor.x += tight
+        self._marked(cursor, ARROW_UP, number(cpu.load_max), 3)
         self._unit(cursor, "%")
-        cursor.x += self.GAP_S
+        cursor.x += wide
         self._value(cursor, number(cpu.clock_avg, 2), 4)
-        cursor.x += self.GAP_S
-        self._mark(cursor, ARROW_UP)
-        self._value(cursor, number(cpu.clock_max, 2), 4)
+        cursor.x += tight
+        self._marked(cursor, ARROW_UP, number(cpu.clock_max, 2), 4)
         self._unit(cursor, "ГГц")  # ГГц
-        cursor.x += self.GAP
+        cursor.x += wide
 
         self._draw_core_graph(cursor)
-        cursor.x += self.GAP
+        cursor.x += wide
 
         self._value(cursor, number(cpu.temp), 3)
         self._unit(cursor, "°C")
@@ -304,13 +333,13 @@ class OverlayWidget(QWidget):
 
         # --- ГП ---
         self._label(cursor, "GPU", C_GPU)
-        cursor.x += self.GAP_S
+        cursor.x += tight
         self._value(cursor, number(gpu.load), 3)
         self._unit(cursor, "%")
-        cursor.x += self.GAP
+        cursor.x += wide
         self._value(cursor, number(gpu.temp), 3)
         self._unit(cursor, "°C")
-        cursor.x += self.GAP
+        cursor.x += wide
         self._value(cursor, number(gpu.vram_used, 1), 4)
         self._draw_text(cursor, "/", self.font_value, self.fm_value, C_UNIT,
                         self.BAND_VALUE, None, Qt.AlignmentFlag.AlignHCenter)
@@ -321,7 +350,7 @@ class OverlayWidget(QWidget):
 
         # --- ОЗУ ---
         self._label(cursor, "RAM", C_RAM)
-        cursor.x += self.GAP_S
+        cursor.x += tight
         self._value(cursor, number(ram.used, 1), 4)
         self._draw_text(cursor, "/", self.font_value, self.fm_value, C_UNIT,
                         self.BAND_VALUE, None, Qt.AlignmentFlag.AlignHCenter)

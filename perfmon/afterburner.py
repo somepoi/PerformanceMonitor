@@ -36,6 +36,7 @@ HDR_GPU_ENTRY_SIZE = 0x1C
 # --- MAHM_SHARED_MEMORY_ENTRY ---
 STR_SIZE = 260
 ENTRY_SRC_NAME = 0x000
+ENTRY_SRC_UNITS = 0x104   # 260
 ENTRY_DATA = 0x514        # 5 * 260
 ENTRY_MIN_LIMIT = 0x518
 ENTRY_MAX_LIMIT = 0x51C
@@ -45,7 +46,7 @@ ENTRY_SRC_ID = 0x528
 
 # --- MAHM_SHARED_MEMORY_GPU_ENTRY ---
 GPU_DEVICE = 0x208        # szDevice, третья строка подряд
-GPU_MEM_AMOUNT = 0x514    # dwMemAmount, КБ -- после пяти строк
+# dwMemAmount (0x514) не используется: Afterburner оставляет его нулевым
 
 RECONNECT_SECONDS = 5.0
 STALE_SECONDS = 10.0
@@ -65,7 +66,6 @@ class HardwareReading:
     gpu_load: float | None = None                  # %
     gpu_temp: float | None = None                  # °C
     vram_used: float | None = None                 # МБ
-    vram_total: float | None = None                # МБ
 
 
 class AfterburnerSource:
@@ -79,12 +79,14 @@ class AfterburnerSource:
         self._last_time = 0
         self._last_change = time.perf_counter()
 
-        # Разобранная раскладка: имя источника -> смещение поля data
-        self._simple: dict[str, int] = {}
+        # Раскладка: имя источника -> список (смещение data, индекс видеокарты).
+        # Именно список: при двух видеоадаптерах Afterburner заводит по записи
+        # «GPU temperature» и «Memory usage» на каждый, и запоминать только
+        # первую нельзя -- у неработающего адаптера там ноль.
+        self._sources: dict[str, list[tuple[int, int]]] = {}
         self._core_usage: list[int] = []
         self._core_clock: list[int] = []
-        self._gpu_name: str | None = None
-        self._vram_total: float | None = None      # МБ, из описания видеокарты
+        self._gpu_names: list[str] = []
 
         self._connect()
 
@@ -113,10 +115,10 @@ class AfterburnerSource:
         if self._shm is not None:
             self._shm.close()
             self._shm = None
-        self._simple.clear()
+        self._sources.clear()
         self._core_usage.clear()
         self._core_clock.clear()
-        self._vram_total = None
+        self._gpu_names.clear()
         self.sensor_count = 0
 
     @property
@@ -128,8 +130,9 @@ class AfterburnerSource:
         return f"{self.version >> 16}.{self.version & 0xFFFF}"
 
     @property
-    def gpu_name(self) -> str | None:
-        return self._gpu_name
+    def core_count(self) -> int:
+        """Сколько ядер Afterburner отдаёт по отдельности."""
+        return len(self._core_usage)
 
     # -- разбор раскладки (однократно) --------------------------------------
     def _map_layout(self) -> None:
@@ -159,34 +162,69 @@ class AfterburnerSource:
                 clock.append((int(match.group(1)), data_offset))
                 continue
 
-            self._simple.setdefault(name.lower(), data_offset)
+            gpu_index = shm.u32(base + ENTRY_GPU)
+            self._sources.setdefault(name.lower(), []).append((data_offset, gpu_index))
 
         self._core_usage = [offset for _, offset in sorted(usage)]
         self._core_clock = [offset for _, offset in sorted(clock)]
 
-        # Модель и объём видеопамяти -- из массива описаний за массивом датчиков.
-        # Именно отсюда, а не из maxLimit датчика «Memory usage»: maxLimit
-        # задаёт предел шкалы графика в Afterburner и к объёму памяти отношения
-        # не имеет (для карты на 16 ГБ он спокойно бывает равен 8).
+        # Названия видеокарт -- из массива описаний за массивом датчиков
         gpu_count = shm.u32(HDR_NUM_GPU_ENTRIES)
         gpu_size = shm.u32(HDR_GPU_ENTRY_SIZE)
-        if gpu_count and gpu_size:
-            base = header_size + entry_count * entry_size
-            self._gpu_name = shm.text(base + GPU_DEVICE, STR_SIZE).strip() or None
-            memory_kb = shm.u32(base + GPU_MEM_AMOUNT)
-            self._vram_total = memory_kb / 1024.0 if memory_kb else None
+        base = header_size + entry_count * entry_size
+        for index in range(gpu_count):
+            entry = base + index * gpu_size
+            self._gpu_names.append(shm.text(entry + GPU_DEVICE, STR_SIZE).strip())
+
+    def list_sensors(self) -> list[tuple[str, float, str, int]]:
+        """Все датчики Afterburner: (имя, значение, единицы, индекс видеокарты).
+
+        Нужно, когда на чужой машине чего-то не хватает: одним взглядом видно,
+        как там названы источники и какие из них живые.
+        """
+        shm = self._shm
+        if shm is None:
+            return []
+        header_size = shm.u32(HDR_HEADER_SIZE)
+        entry_count = shm.u32(HDR_NUM_ENTRIES)
+        entry_size = shm.u32(HDR_ENTRY_SIZE)
+        out = []
+        for index in range(entry_count):
+            base = header_size + index * entry_size
+            name = shm.text(base + ENTRY_SRC_NAME, STR_SIZE).strip()
+            if not name:
+                continue
+            out.append((name, float(shm.f32(base + ENTRY_DATA)),
+                        shm.text(base + ENTRY_SRC_UNITS, STR_SIZE).strip(),
+                        shm.u32(base + ENTRY_GPU)))
+        return out
 
     # -- чтение -------------------------------------------------------------
+    def _pick(self, name: str, positive: bool = True) -> tuple[float | None, int]:
+        """Значение датчика и индекс видеокарты, которой оно принадлежит.
+
+        При нескольких адаптерах побеждает первый ненулевой: у простаивающего
+        встроенного видеоядра датчики отдают ноль, и брать первый попавшийся
+        нельзя -- именно из-за этого пропадала загрузка видеопамяти.
+        """
+        candidates = self._sources.get(name)
+        if not candidates or self._shm is None:
+            return None, 0
+        fallback = None
+        for offset, gpu_index in candidates:
+            value = float(self._shm.f32(offset))
+            if value > 0.0:
+                return value, gpu_index
+            if fallback is None:
+                fallback = (value, gpu_index)
+        # Датчик, которого нет на этом железе, Afterburner отдаёт нулём: ни
+        # температура, ни частота, ни объём памяти нулём быть не могут.
+        if positive or fallback is None:
+            return None, 0
+        return fallback
+
     def _value(self, name: str, positive: bool = True) -> float | None:
-        offset = self._simple.get(name)
-        if offset is None or self._shm is None:
-            return None
-        value = self._shm.f32(offset)
-        # Датчик, которого нет на этом железе, Afterburner отдаёт нулём:
-        # ни температура, ни частота, ни объём памяти нулём быть не могут.
-        if positive and value <= 0.0:
-            return None
-        return float(value)
+        return self._pick(name, positive)[0]
 
     def read(self) -> HardwareReading:
         out = HardwareReading()
@@ -209,11 +247,20 @@ class AfterburnerSource:
         out.cpu_load = self._value("cpu usage", positive=False)
         out.cpu_clock = self._value("cpu clock")
         out.cpu_temp = self._value("cpu temperature")
-        out.gpu_load = self._value("gpu usage", positive=False)
-        out.gpu_temp = self._value("gpu temperature")
-        out.vram_used = self._value("memory usage")
-        out.vram_total = self._vram_total
-        out.gpu_name = self._gpu_name
+
+        out.gpu_load, gpu_index = self._pick("gpu usage", positive=False)
+        out.gpu_temp, temp_gpu = self._pick("gpu temperature")
+        # «Memory usage» -- название Afterburner для занятой видеопамяти. На
+        # некоторых сборках датчик зовётся иначе, поэтому проверяем синонимы.
+        for name in ("memory usage", "gpu memory usage", "memory used"):
+            out.vram_used, vram_gpu = self._pick(name)
+            if out.vram_used is not None:
+                gpu_index = vram_gpu
+                break
+        if out.gpu_temp is not None and out.gpu_load in (None, 0.0):
+            gpu_index = temp_gpu
+        if gpu_index < len(self._gpu_names):
+            out.gpu_name = self._gpu_names[gpu_index] or None
 
         out.cpu_load_per_core = [max(0.0, shm.f32(offset)) for offset in self._core_usage]
         # Нули не выбрасываем: списки загрузок и частот должны совпадать по
