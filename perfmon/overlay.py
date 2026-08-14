@@ -221,23 +221,34 @@ class OverlayWidget(QWidget):
 
                 step = width / max(1, FPS_HISTORY - 1)
                 offset = len(history) - 1
-                points = [QPointF(rect.right() - (offset - i) * step, y_of(v))
-                          for i, v in enumerate(history)]
 
-                # Зелёная линия -- среднее за последние 90 с
-                window = history[-FPS_AVG_WINDOW:]
-                average = sum(window) / len(window)
-                painter.setPen(self._pen_avg)
-                y_avg = y_of(average)
-                painter.drawLine(QPointF(rect.left(), y_avg),
-                                 QPointF(rect.right(), y_avg))
+                def x_of(index: int) -> float:
+                    return rect.right() - (offset - index) * step
 
+                points = [QPointF(x_of(i), y_of(v)) for i, v in enumerate(history)]
+
+                # Зелёная линия -- скользящее среднее: в каждой точке это
+                # среднее по предыдущим 90 с. Пока истории меньше, окно короче,
+                # поэтому кривая начинается от самого края, а не с 90-й секунды.
+                averages = []
+                running = 0.0
+                for index, value in enumerate(history):
+                    running += value
+                    if index >= FPS_AVG_WINDOW:
+                        running -= history[index - FPS_AVG_WINDOW]
+                    averages.append(running / min(index + 1, FPS_AVG_WINDOW))
+                average_points = [QPointF(x_of(i), y_of(v))
+                                  for i, v in enumerate(averages)]
+
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                if len(average_points) >= 2:
+                    painter.setPen(self._pen_avg)
+                    painter.drawPolyline(QPolygonF(average_points))
                 # Красная линия -- текущие значения
                 if len(points) >= 2:
-                    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                     painter.setPen(self._pen_line)
                     painter.drawPolyline(QPolygonF(points))
-                    painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         cursor.x += width
 
         # Минимум и максимум графика -- правее него, столбиком

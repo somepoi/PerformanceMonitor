@@ -179,6 +179,16 @@ def run(argv: list | None = None) -> int:
     for note in (fps_note, *collector.notes):
         print(f"  * {note}")
 
+    gaps = collector.hardware.missing_sources()
+    if not getattr(fps_source, "connected", True):
+        gaps.insert(0, "RivaTuner Statistics Server не запущен -- FPS не будет")
+    if gaps:
+        print("\nНе хватает данных -- эти поля покажут «--»:", file=sys.stderr)
+        for gap in gaps:
+            print(f"  ! {gap}", file=sys.stderr)
+        print("Включаются в MSI Afterburner: Settings -> Monitoring, "
+              "галочка у нужного графика.\n", file=sys.stderr)
+
     overlay = OverlayWidget(scale=args.scale,
                             click_through=not args.no_click_through)
     screens = app.screens()

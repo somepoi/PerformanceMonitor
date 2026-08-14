@@ -94,9 +94,8 @@ def read_memory() -> RamStats:
     return RamStats()
 
 
-# ---------------------------------------------------------------------------
-# Загрузка ядер -- запасной источник
-# ---------------------------------------------------------------------------
+# Число логических процессоров -- только для диагностики (--list-sensors),
+# в сборе метрик не участвует: ядра берутся из Afterburner как есть.
 ALL_PROCESSOR_GROUPS = 0xFFFF
 _kernel32.GetActiveProcessorCount.argtypes = [wintypes.WORD]
 _kernel32.GetActiveProcessorCount.restype = wintypes.DWORD
@@ -105,71 +104,6 @@ _kernel32.GetActiveProcessorCount.restype = wintypes.DWORD
 def logical_processor_count() -> int:
     """Сколько логических процессоров в системе по мнению Windows."""
     return int(_kernel32.GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)) or 0
-
-
-class SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION(ctypes.Structure):
-    _fields_ = [("IdleTime", ctypes.c_longlong),
-                ("KernelTime", ctypes.c_longlong),
-                ("UserTime", ctypes.c_longlong),
-                ("DpcTime", ctypes.c_longlong),
-                ("InterruptTime", ctypes.c_longlong),
-                ("InterruptCount", wintypes.ULONG)]
-
-
-_ntdll = ctypes.WinDLL("ntdll.dll")
-_SYSTEM_PROCESSOR_PERFORMANCE = 8
-
-
-class CoreLoadCounter:
-    """Загрузка каждого логического процессора средствами Windows.
-
-    Нужен, когда Afterburner отдаёт датчики не для всех ядер: на части машин
-    он показывает только первые четыре, и график ядер выглядит так, будто
-    процессор четырёхъядерный. ``NtQuerySystemInformation`` всегда возвращает
-    полный набор, стоит десятки микросекунд и не требует ни прав, ни сторонних
-    программ.
-    """
-
-    def __init__(self) -> None:
-        self.count = logical_processor_count()
-        self._buffer = (SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION * max(1, self.count))()
-        self._previous: list[tuple[int, int]] = []
-        self.read()   # первый вызов задаёт точку отсчёта
-
-    def read(self) -> list[float]:
-        size = ctypes.sizeof(self._buffer)
-        written = wintypes.ULONG(0)
-        status = _ntdll.NtQuerySystemInformation(
-            _SYSTEM_PROCESSOR_PERFORMANCE, ctypes.byref(self._buffer),
-            size, ctypes.byref(written))
-        if status != 0:
-            return []
-
-        current = []
-        for index in range(self.count):
-            item = self._buffer[index]
-            # KernelTime у Windows уже включает в себя IdleTime
-            total = item.KernelTime + item.UserTime
-            current.append((total, item.IdleTime))
-
-        loads: list[float] = []
-        measured = False
-        if len(self._previous) == len(current):
-            for (total, idle), (prev_total, prev_idle) in zip(
-                    current, self._previous, strict=True):
-                delta_total = total - prev_total
-                delta_idle = idle - prev_idle
-                if delta_total <= 0:
-                    loads.append(0.0)
-                else:
-                    measured = True
-                    busy = (delta_total - delta_idle) * 100.0 / delta_total
-                    loads.append(max(0.0, min(100.0, busy)))
-        self._previous = current
-        # Между двумя вызовами подряд счётчики не успевают сдвинуться, и вышел
-        # бы честный на вид, но пустой список нулей. Лучше сообщить, что данных
-        # ещё нет, и дать вызывающему показать прежние значения.
-        return loads if measured else []
 
 
 # Класс видеоадаптеров в реестре
@@ -244,9 +178,6 @@ class MetricsCollector:
         # Объём видеопамяти постоянен -- читаем реестр один раз, а не каждый тик
         self._vram_total: float | None = None
         self._vram_probed_for: str | None = "\x00"   # заведомо не равно имени ГП
-        # Запасной счётчик ядер поднимается, только если Afterburner отдал не все
-        self._system_cores = logical_processor_count()
-        self._core_counter: CoreLoadCounter | None = None
 
     @property
     def connected(self) -> bool:
@@ -259,18 +190,6 @@ class MetricsCollector:
         # --- ЦП ---
         cpu = snapshot.cpu
         cores = reading.cpu_load_per_core
-        if len(cores) < self._system_cores:
-            # Afterburner показал не все ядра (а на части машин -- только четыре
-            # из шестнадцати). Считаем загрузку сами, средствами Windows.
-            if self._core_counter is None:
-                self._core_counter = CoreLoadCounter()
-                note = (f"Ядра: Afterburner отдал {len(cores)} из "
-                        f"{self._system_cores}, загрузка считается через Windows")
-                self.notes.append(note)
-                print(f"  * {note}")   # список источников уже напечатан выше
-            measured = self._core_counter.read()
-            if measured:
-                cores = measured
         cpu.per_core = cores
         if cores:
             cpu.load_avg = sum(cores) / len(cores)

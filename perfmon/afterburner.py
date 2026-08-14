@@ -54,6 +54,20 @@ STALE_SECONDS = 10.0
 _CORE_USAGE = re.compile(r"^CPU(\d+)\s+usage$", re.IGNORECASE)
 _CORE_CLOCK = re.compile(r"^CPU(\d+)\s+clock$", re.IGNORECASE)
 
+# Занятая видеопамять называется по-разному в разных сборках Afterburner
+VRAM_NAMES = ("memory usage", "gpu memory usage", "memory used")
+
+# Что должно быть включено в Afterburner, чтобы строка заполнилась целиком.
+# Пары «имена источников -> что покажет строка».
+REQUIRED_SOURCES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("cpu usage",), "CPU usage -- общая загрузка ЦП"),
+    (("cpu clock",), "CPU clock -- частота ЦП"),
+    (("cpu temperature",), "CPU temperature -- температура ЦП"),
+    (("gpu usage",), "GPU usage -- загрузка ГП"),
+    (("gpu temperature",), "GPU temperature -- температура ГП"),
+    (VRAM_NAMES, "Memory usage -- занятая видеопамять"),
+)
+
 
 @dataclass
 class HardwareReading:
@@ -133,6 +147,25 @@ class AfterburnerSource:
     def core_count(self) -> int:
         """Сколько ядер Afterburner отдаёт по отдельности."""
         return len(self._core_usage)
+
+    def missing_sources(self) -> list[str]:
+        """Чего не хватает, чтобы строка заполнилась целиком.
+
+        Afterburner отдаёт только те датчики, что включены у него в
+        *Settings → Monitoring*. Если чего-то нет, соответствующее поле молча
+        показывало бы ``--``, поэтому список печатается при запуске.
+        """
+        if not self.connected:
+            return ["MSI Afterburner не запущен -- показаний железа не будет"]
+
+        gaps = [text for names, text in REQUIRED_SOURCES
+                if not any(name in self._sources for name in names)]
+        if not self._core_usage:
+            gaps.append("CPU1..N usage -- загрузка ядер (график ядер будет пуст)")
+        if not self._core_clock:
+            gaps.append("CPU1..N clock -- частоты ядер "
+                        "(обе частоты покажут одно общее значение)")
+        return gaps
 
     # -- разбор раскладки (однократно) --------------------------------------
     def _map_layout(self) -> None:
@@ -252,7 +285,7 @@ class AfterburnerSource:
         out.gpu_temp, temp_gpu = self._pick("gpu temperature")
         # «Memory usage» -- название Afterburner для занятой видеопамяти. На
         # некоторых сборках датчик зовётся иначе, поэтому проверяем синонимы.
-        for name in ("memory usage", "gpu memory usage", "memory used"):
+        for name in VRAM_NAMES:
             out.vram_used, vram_gpu = self._pick(name)
             if out.vram_used is not None:
                 gpu_index = vram_gpu
