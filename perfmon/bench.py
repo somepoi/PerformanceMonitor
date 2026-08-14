@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-import csv
-import io
 import statistics
 import sys
 import time
@@ -29,28 +27,46 @@ def _measure(label: str, fn: Callable[[], object], repeats: int) -> None:
 
 
 def _bench_sources() -> None:
-    import psutil
-
+    from .afterburner import open_afterburner
     from .sources import MetricsCollector, read_memory
 
     print("Сбор метрик")
     started = time.perf_counter()
-    collector = MetricsCollector()
+    hardware, note = open_afterburner()
     elapsed = (time.perf_counter() - started) * 1000.0
-    print(f"  {'MetricsCollector() -- старт':<40s} {elapsed:7.1f} мс")
-    for note in collector.notes:
-        print(f"    {note}")
+    print(f"  {'подключение к Afterburner':<40s} {elapsed:7.3f} мс")
+    print(f"    {note}")
+    if not hardware.connected:
+        print("    Afterburner не запущен -- замеры пойдут по пустым данным")
 
+    collector = MetricsCollector(hardware)
     try:
-        _measure("collector.read() -- весь снимок", collector.read, 30)
-        _measure("  ЦП: PDH", collector.cpu.read, 30)
-        if collector.gpu_source is not None:
-            _measure("  ГП", collector.gpu_source.read, 30)
-        _measure("  ОЗУ: GlobalMemoryStatusEx", read_memory, 500)
-        _measure("  ОЗУ: psutil.virtual_memory (для сравнения)",
-                 psutil.virtual_memory, 100)
+        _measure("collector.read() -- весь снимок", collector.read, 300)
+        _measure("  afterburner.read() -- сырые датчики", hardware.read, 300)
+        _measure("  GlobalMemoryStatusEx (запасной ОЗУ)", read_memory, 500)
     finally:
         collector.close()
+
+
+def _bench_fps() -> None:
+    from .rtss import RtssFpsSource
+
+    print("\nFPS")
+    started = time.perf_counter()
+    source = RtssFpsSource()
+    elapsed = (time.perf_counter() - started) * 1000.0
+    print(f"  {'подключение к RTSS':<40s} {elapsed:7.3f} мс")
+    if not source.connected:
+        print("    RTSS не запущен -- измеряется только холостой путь")
+    else:
+        print(f"    RTSS {source.version_text}, "
+              f"приложений в списке: {len(source.entries())}")
+    try:
+        _measure("stats() -- то, что зовётся каждый тик", source.stats, 300)
+        _measure("entries() -- полный разбор списка приложений",
+                 source.entries, 300)
+    finally:
+        source.close()
 
 
 def _bench_overlay() -> None:
@@ -58,8 +74,8 @@ def _bench_overlay() -> None:
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
 
-    from .fps import FpsStats
     from .overlay import OverlayWidget
+    from .rtss import FpsStats
     from .sources import CpuStats, GpuStats, RamStats, Snapshot
 
     widget = OverlayWidget()
@@ -79,46 +95,14 @@ def _bench_overlay() -> None:
     del app
 
 
-def _bench_fps_parsing() -> None:
-    from .fps import BUCKET_SECONDS
-
-    header = ("Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,"
-              "PresentFlags,AllowsTearing,PresentMode,FrameType,CPUStartTime,FrameTime,"
-              "CPUBusy,CPUWait,GPULatency,GPUTime,GPUBusy,VideoBusy,GPUWait,"
-              "DisplayLatency,DisplayedTime\n")
-    rows = "".join(
-        f"game.exe,4242,0x1,DXGI,1,0,1,Hardware,Application,{index * 0.004:.6f},"
-        f"4.0,2.0,1.0,3.0,3.5,3.0,0.0,0.5,8.0,4.1\n"
-        for index in range(20000))
-    blob = header + rows
-    target = "4242"
-
-    def parse() -> int:
-        stream = io.StringIO(blob)
-        reader = csv.reader(stream)
-        next(reader)
-        out = []
-        append = out.append
-        for row in reader:
-            if row[1] != target:
-                continue
-            append(float(row[9]))
-        return len(out)
-
-    count = parse()
-    print("\nРазбор потока PresentMon")
-    _measure(f"csv.reader: {count} строк", parse, 20)
-    print(f"  корзина минимума/максимума: {BUCKET_SECONDS * 1000:.0f} мс")
-
-
 def main() -> int:
     if sys.platform != "win32":
         print("Бенчмарк рассчитан на Windows.", file=sys.stderr)
         return 2
     _bench_sources()
+    _bench_fps()
     _bench_overlay()
-    _bench_fps_parsing()
-    print("\nБюджет на тик = сумма «collector.read()» и «update_data()»;"
+    print("\nБюджет на тик = сумма «collector.read()», «stats()» и «update_data()»;"
           " при обновлении раз в секунду это доля процента одного ядра.")
     return 0
 

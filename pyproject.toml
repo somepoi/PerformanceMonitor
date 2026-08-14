@@ -1,6 +1,6 @@
 [project]
 name = "performance-monitor"
-description = "Оверлей мониторинга производительности в стиле Steam: FPS, ЦП, ГП, ОЗУ"
+description = "Оверлей мониторинга производительности в стиле Steam поверх RTSS и MSI Afterburner"
 readme = "README.md"
 # Нижняя граница продиктована PySide6 6.11 (нужен 3.10+), верхняя -- её же
 # верхним потолком. Проверить актуальность: `pdm lock` подскажет диапазон сам.
@@ -8,9 +8,10 @@ requires-python = ">=3.10,<3.15"
 license = { text = "MIT" }
 dynamic = ["version"]
 
+# Всё, что нужно кроме интерфейса, читается из общей памяти через ctypes,
+# поэтому сторонних библиотек для сбора метрик не требуется вовсе.
 dependencies = [
     "PySide6>=6.6",
-    "psutil>=5.9",
 ]
 
 classifiers = [
@@ -19,17 +20,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: System :: Monitoring",
 ]
-
-# Необязательные источники данных. Ставятся отдельно, потому что каждый
-# тянет свою тяжёлую зависимость, а монитор работает и без них.
-[project.optional-dependencies]
-# Загрузка / температура / видеопамять NVIDIA напрямую от драйвера
-nvidia = ["nvidia-ml-py>=12.535"]
-# Температуры ЦП и ГП: LibreHardwareMonitorLib.dll внутри процесса
-sensors = ["pythonnet>=3.0"]
-# То же, но через WMI уже запущенного LibreHardwareMonitor
-wmi = ["WMI>=1.5.1; sys_platform == 'win32'"]
-all = ["performance-monitor[nvidia,sensors,wmi]"]
 
 [project.scripts]
 performance-monitor = "perfmon.app:run"
@@ -47,9 +37,6 @@ build-backend = "pdm.backend"
 
 [tool.pdm]
 distribution = true
-# Старые сборки pythonnet ограничены Python<3.11 и отсеиваются резолвером --
-# это ожидаемо, берётся более новая версия
-ignore_package_warnings = ["pythonnet"]
 
 [tool.pdm.version]
 source = "file"
@@ -60,8 +47,7 @@ includes = ["perfmon"]
 
 [tool.pdm.scripts]
 start = { cmd = "python main.py", help = "Запустить оверлей" }
-admin = { cmd = "python main.py --elevate", help = "Запустить с повышением прав (нужно для FPS)" }
-demo = { cmd = "python main.py --fps demo", help = "Запустить с псевдо-FPS, без PresentMon" }
+demo = { cmd = "python main.py --fps demo", help = "Запустить с псевдо-FPS, без RTSS" }
 bench = { cmd = "python -m perfmon.bench", help = "Замерить стоимость сбора метрик и отрисовки" }
 lint = { cmd = "ruff check perfmon main.py", help = "Проверить стиль" }
 fmt = { cmd = "ruff format perfmon main.py", help = "Отформатировать" }

@@ -10,7 +10,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
-from .fps import FpsStats
+from .rtss import FpsStats
 from .sources import Snapshot
 
 # --- палитра ---------------------------------------------------------------

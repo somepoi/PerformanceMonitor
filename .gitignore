@@ -10,7 +10,5 @@ dist/
 .venv/
 __pypackages__/
 
-# Внешние бинарники, которые кладутся вручную
-PresentMon*.exe
-tools/
-lib/
+# ruff
+.ruff_cache/
