@@ -311,6 +311,11 @@ class RtssFpsSource:
         with self._lock:
             return self._current_name
 
+    @property
+    def in_game(self) -> bool:
+        """Сейчас есть приложение, которое выводит кадры."""
+        return self._current_offset is not None
+
     def close(self) -> None:
         self._stop.set()
         if self._worker.is_alive():

@@ -14,6 +14,7 @@ from ctypes import wintypes
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 FILE_MAP_READ = 0x0004
+FILE_MAP_WRITE = 0x0002
 ERROR_FILE_NOT_FOUND = 2
 
 _kernel32.OpenFileMappingW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
@@ -34,21 +35,23 @@ class SharedMemoryMissing(OSError):
 class SharedMemory:
     """Отображение именованной общей памяти только на чтение."""
 
-    def __init__(self, name: str) -> None:
-        handle = _kernel32.OpenFileMappingW(FILE_MAP_READ, False, name)
+    def __init__(self, name: str, writable: bool = False) -> None:
+        access = FILE_MAP_READ | (FILE_MAP_WRITE if writable else 0)
+        handle = _kernel32.OpenFileMappingW(access, False, name)
         if not handle:
             code = ctypes.get_last_error()
             if code == ERROR_FILE_NOT_FOUND:
                 raise SharedMemoryMissing(f"объект «{name}» не найден")
             raise OSError(f"OpenFileMappingW({name}) failed: {code}")
 
-        address = _kernel32.MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0)
+        address = _kernel32.MapViewOfFile(handle, access, 0, 0, 0)
         if not address:
             code = ctypes.get_last_error()
             _kernel32.CloseHandle(handle)
             raise OSError(f"MapViewOfFile({name}) failed: {code}")
 
         self.name = name
+        self.writable = writable
         self._handle = handle
         self._address = int(address)
 
@@ -65,6 +68,20 @@ class SharedMemory:
     def text(self, offset: int, size: int) -> str:
         """Строка фиксированной длины с завершающим нулём (ASCII)."""
         return self.raw(offset, size).split(b"\x00", 1)[0].decode("latin-1")
+
+    # -- запись (нужна для OSD-слота RTSS) ----------------------------------
+    def set_u32(self, offset: int, value: int) -> None:
+        ctypes.c_uint32.from_address(self._address + offset).value = value & 0xFFFFFFFF
+
+    def set_text(self, offset: int, size: int, text: str) -> None:
+        """Записать строку с завершающим нулём в поле фиксированной длины.
+
+        Поля OSD у RTSS объявлены как ``char[]``, то есть однобайтовые.
+        Непредставимые символы заменяются, чтобы кодировка не уронила запись.
+        """
+        raw = text.encode("cp1252", "replace")[:size - 1]
+        buffer = raw + b"\x00" * (size - len(raw))
+        ctypes.memmove(self._address + offset, buffer, size)
 
     # -- жизненный цикл -----------------------------------------------------
     def close(self) -> None:

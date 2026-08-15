@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
+from .osd import RtssOsd, format_line
 from .overlay import OverlayWidget
 from .rtss import FpsStats, open_fps_source
 from .sources import MetricsCollector, Snapshot
@@ -102,6 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--priority", default="normal",
                         choices=("normal", "below", "idle"),
                         help="приоритет процесса: below/idle уступают ЦП игре")
+    parser.add_argument("--display", default="auto",
+                        choices=("auto", "window", "rtss", "both"),
+                        help="где рисовать: window -- своё окно (в полноэкранных "
+                             "играх не видно), rtss -- OSD внутри игры, "
+                             "auto -- окно на рабочем столе и OSD в игре")
+    parser.add_argument("--osd-plain", action="store_true",
+                        help="не использовать цветовые теги в OSD RTSS")
     parser.add_argument("--list-sensors", action="store_true",
                         help="напечатать все датчики Afterburner и выйти "
                              "(для разбора, чего не хватает на конкретной машине)")
@@ -124,6 +132,13 @@ def _list_sensors() -> int:
         print(f"{name:<28} {value:12.2f}  {units:<6} {gpu}")
     hardware.close()
     return 0
+
+
+def is_admin() -> bool:
+    try:
+        return bool(ctypes.WinDLL("shell32.dll").IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 def _force_utf8(stream) -> None:
@@ -199,8 +214,39 @@ def run(argv: list | None = None) -> int:
     overlay.apply_native_flags()
     overlay.raise_topmost()
 
+    # OSD внутри игры: обычное окно в полноэкранном режиме не видно в принципе,
+    # там экраном владеет игра. Рисовать внутри неё может только RTSS.
+    osd: RtssOsd | None = None
+    if args.display in ("auto", "rtss", "both"):
+        osd = RtssOsd()
+        if not osd.available:
+            print(f"OSD RTSS недоступен: {osd.error}", file=sys.stderr)
+            if not is_admin():
+                print("Похоже, RTSS запущен от администратора, а монитор -- нет. "
+                      "Запустите монитор так же или используйте --display window.",
+                      file=sys.stderr)
+            osd = None
+        elif args.display == "rtss":
+            overlay.hide()
+
+    rich_osd = not args.osd_plain
+
+    def on_sample(snapshot: Snapshot, fps: FpsStats) -> None:
+        overlay.update_data(snapshot, fps)
+        if osd is not None:
+            osd.update(format_line(snapshot, fps, rich=rich_osd))
+        if args.display == "auto" and osd is not None:
+            # В игре строку показывает RTSS, на рабочем столе -- своё окно.
+            # Так они не дублируют друг друга в оконных играх без рамки.
+            visible = not getattr(fps_source, "in_game", False)
+            if overlay.isVisible() != visible:
+                overlay.setVisible(visible)
+                if visible:
+                    overlay.apply_native_flags()
+                    overlay.raise_topmost()
+
     worker = MetricsWorker(collector, fps_source, max(0.05, args.interval))
-    worker.sample.connect(overlay.update_data, Qt.ConnectionType.QueuedConnection)
+    worker.sample.connect(on_sample, Qt.ConnectionType.QueuedConnection)
     worker.start()
 
     # Полноэкранные приложения периодически «выталкивают» оверлей вниз по Z-порядку
@@ -243,6 +289,8 @@ def run(argv: list | None = None) -> int:
         code = app.exec()
     finally:
         worker.stop()
+        if osd is not None:
+            osd.close()          # освобождаем слот, иначе строка зависнет в играх
         try:
             fps_source.close()
         except Exception:
