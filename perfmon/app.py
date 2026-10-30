@@ -19,6 +19,37 @@ from .rtss import FpsStats, open_fps_source
 from .sources import MetricsCollector, Snapshot
 
 
+class OverlayVisibility:
+    """Выбор пользователя сохраняется при автоматическом переключении вывода."""
+
+    def __init__(self, overlay: OverlayWidget, display: str) -> None:
+        self.overlay = overlay
+        self.display = display
+        self.enabled = True
+        self._in_game = False
+        self._osd_ready = False
+        self.action = QAction("Скрыть оверлей")
+        self.action.triggered.connect(self.toggle)
+
+    def refresh(self, *, in_game: bool, osd_ready: bool) -> None:
+        self._in_game = in_game
+        self._osd_ready = osd_ready
+        window_allowed = not osd_ready or self.display != "rtss"
+        if self.display == "auto" and osd_ready and in_game:
+            window_allowed = False
+        visible = self.enabled and window_allowed
+        if self.overlay.isVisible() != visible:
+            self.overlay.setVisible(visible)
+            if visible:
+                self.overlay.apply_native_flags()
+                self.overlay.raise_topmost()
+        self.action.setText("Скрыть оверлей" if self.enabled else "Показать оверлей")
+
+    def toggle(self) -> None:
+        self.enabled = not self.enabled
+        self.refresh(in_game=self._in_game, osd_ready=self._osd_ready)
+
+
 class MetricsWorker(QObject):
     """Опрашивает датчики в фоновом потоке и отдаёт снимки в UI-поток."""
 
@@ -226,24 +257,20 @@ def run(argv: list | None = None) -> int:
                       "Запустите монитор так же или используйте --display window.",
                       file=sys.stderr)
             osd = None
-        elif args.display == "rtss":
-            overlay.hide()
 
     rich_osd = not args.osd_plain
+    visibility = OverlayVisibility(overlay, args.display)
+    visibility.refresh(in_game=getattr(fps_source, "in_game", False),
+                       osd_ready=False)
 
     def on_sample(snapshot: Snapshot, fps: FpsStats) -> None:
         overlay.update_data(snapshot, fps)
+        osd_ready = False
         if osd is not None:
-            osd.update(format_line(snapshot, fps, rich=rich_osd))
-        if args.display == "auto" and osd is not None:
-            # В игре строку показывает RTSS, на рабочем столе -- своё окно.
-            # Так они не дублируют друг друга в оконных играх без рамки.
-            visible = not getattr(fps_source, "in_game", False)
-            if overlay.isVisible() != visible:
-                overlay.setVisible(visible)
-                if visible:
-                    overlay.apply_native_flags()
-                    overlay.raise_topmost()
+            text = format_line(snapshot, fps, rich=rich_osd) if visibility.enabled else ""
+            osd_ready = osd.update(text)
+        visibility.refresh(in_game=getattr(fps_source, "in_game", False),
+                           osd_ready=osd_ready)
 
     worker = MetricsWorker(collector, fps_source, max(0.05, args.interval))
     worker.sample.connect(on_sample, Qt.ConnectionType.QueuedConnection)
@@ -260,20 +287,13 @@ def run(argv: list | None = None) -> int:
         tray.setToolTip("Performance Monitor")
         menu = QMenu()
 
-        toggle = QAction("Скрыть оверлей")
-
-        def on_toggle() -> None:
-            visible = overlay.isVisible()
-            overlay.setVisible(not visible)
-            toggle.setText("Скрыть оверлей" if not visible else "Показать оверлей")
-            if not visible:
-                overlay.apply_native_flags()
-                overlay.raise_topmost()
-
-        toggle.triggered.connect(on_toggle)
+        if osd is not None:
+            # Очищаем OSD сразу, не дожидаясь следующего опроса метрик.
+            visibility.action.triggered.connect(
+                lambda: osd.update("") if not visibility.enabled else None)
         quit_action = QAction("Выход")
         quit_action.triggered.connect(app.quit)
-        menu.addAction(toggle)
+        menu.addAction(visibility.action)
         menu.addSeparator()
         menu.addAction(quit_action)
         tray.setContextMenu(menu)

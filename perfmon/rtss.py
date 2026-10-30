@@ -117,6 +117,7 @@ class RtssFpsSource:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._current_offset: int | None = None
+        self._current_pid: int | None = None
         self._current_name = ""
         self._last_window: tuple[int, int] | None = None
         # (момент получения, FPS за окно RTSS)
@@ -259,10 +260,12 @@ class RtssFpsSource:
                 if entry is None:
                     with self._lock:
                         self._current_offset = None
+                        self._current_pid = None
                         self._current_name = ""
                 elif entry.offset != self._current_offset:
                     with self._lock:
                         self._current_offset = entry.offset
+                        self._current_pid = entry.process_id
                         self._current_name = entry.name
                         self._last_window = None
                         self._samples.clear()
@@ -313,8 +316,9 @@ class RtssFpsSource:
 
     @property
     def in_game(self) -> bool:
-        """Сейчас есть приложение, которое выводит кадры."""
-        return self._current_offset is not None
+        """Игра с показаниями FPS находится на переднем плане."""
+        return (self._current_offset is not None
+                and self._current_pid == foreground_pid())
 
     def close(self) -> None:
         self._stop.set()
