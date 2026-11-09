@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .osd import RtssOsd, format_line
 from .overlay import OverlayWidget
-from .rtss import FpsStats, open_fps_source
+from .rtss import FpsStats, RtssFpsSource, open_fps_source
 from .sources import MetricsCollector, Snapshot
 
 
@@ -26,16 +26,16 @@ class OverlayVisibility:
         self.overlay = overlay
         self.display = display
         self.enabled = True
-        self._in_game = False
+        self._fullscreen = False
         self._osd_ready = False
         self.action = QAction("Скрыть оверлей")
         self.action.triggered.connect(self.toggle)
 
-    def refresh(self, *, in_game: bool, osd_ready: bool) -> None:
-        self._in_game = in_game
+    def refresh(self, *, fullscreen: bool, osd_ready: bool) -> None:
+        self._fullscreen = fullscreen
         self._osd_ready = osd_ready
         window_allowed = not osd_ready or self.display != "rtss"
-        if self.display == "auto" and osd_ready and in_game:
+        if self.display == "auto" and osd_ready and fullscreen:
             window_allowed = False
         visible = self.enabled and window_allowed
         if self.overlay.isVisible() != visible:
@@ -47,7 +47,7 @@ class OverlayVisibility:
 
     def toggle(self) -> None:
         self.enabled = not self.enabled
-        self.refresh(in_game=self._in_game, osd_ready=self._osd_ready)
+        self.refresh(fullscreen=self._fullscreen, osd_ready=self._osd_ready)
 
 
 class MetricsWorker(QObject):
@@ -138,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=("auto", "window", "rtss", "both"),
                         help="где рисовать: window -- своё окно (в полноэкранных "
                              "играх не видно), rtss -- OSD внутри игры, "
-                             "auto -- окно на рабочем столе и OSD в игре")
+                             "auto -- окно, OSD в полноэкранной игре")
     parser.add_argument("--osd-plain", action="store_true",
                         help="не использовать цветовые теги в OSD RTSS")
     parser.add_argument("--list-sensors", action="store_true",
@@ -260,17 +260,19 @@ def run(argv: list | None = None) -> int:
 
     rich_osd = not args.osd_plain
     visibility = OverlayVisibility(overlay, args.display)
-    visibility.refresh(in_game=getattr(fps_source, "in_game", False),
-                       osd_ready=False)
+    visibility.refresh(fullscreen=False, osd_ready=False)
 
     def on_sample(snapshot: Snapshot, fps: FpsStats) -> None:
         overlay.update_data(snapshot, fps)
+        fullscreen = (args.display == "auto" and osd is not None
+                      and isinstance(fps_source, RtssFpsSource)
+                      and fps_source.is_fullscreen_on(int(overlay.winId())))
         osd_ready = False
         if osd is not None:
-            text = format_line(snapshot, fps, rich=rich_osd) if visibility.enabled else ""
+            show_osd = visibility.enabled and (args.display != "auto" or fullscreen)
+            text = format_line(snapshot, fps, rich=rich_osd) if show_osd else ""
             osd_ready = osd.update(text)
-        visibility.refresh(in_game=getattr(fps_source, "in_game", False),
-                           osd_ready=osd_ready)
+        visibility.refresh(fullscreen=fullscreen, osd_ready=osd_ready)
 
     worker = MetricsWorker(collector, fps_source, max(0.05, args.interval))
     worker.sample.connect(on_sample, Qt.ConnectionType.QueuedConnection)

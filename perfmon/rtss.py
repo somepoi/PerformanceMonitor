@@ -28,11 +28,28 @@ import ctypes
 import threading
 import time
 from collections import deque
+from ctypes import wintypes
 from dataclasses import dataclass
 
 from .shmem import SharedMemory, SharedMemoryMissing
 
 _user32 = ctypes.WinDLL("user32.dll")
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.MonitorFromWindow.restype = wintypes.HMONITOR
+
+GWL_STYLE = -16
+WS_CAPTION = 0x00C00000
+MONITOR_DEFAULTTONULL = 0
+
+
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
 
 SHARED_MEMORY_NAME = "RTSSSharedMemoryV2"
 # Многосимвольная константа 'RTSS'. Порядок байт зависит от того, как её
@@ -78,7 +95,10 @@ class FpsStats:
 
 def foreground_pid() -> int:
     """PID процесса, которому принадлежит активное окно."""
-    hwnd = _user32.GetForegroundWindow()
+    return _window_pid(_user32.GetForegroundWindow())
+
+
+def _window_pid(hwnd: int | None) -> int:
     if not hwnd:
         return 0
     pid = ctypes.c_ulong(0)
@@ -314,11 +334,34 @@ class RtssFpsSource:
         with self._lock:
             return self._current_name
 
-    @property
-    def in_game(self) -> bool:
-        """Игра с показаниями FPS находится на переднем плане."""
-        return (self._current_offset is not None
-                and self._current_pid == foreground_pid())
+    def is_fullscreen_on(self, overlay_hwnd: int) -> bool:
+        """Активная игра с FPS занимает весь монитор оверлея."""
+        with self._lock:
+            if self._current_offset is None:
+                return False
+            pid = self._current_pid
+
+        foreground = _user32.GetForegroundWindow()
+        if not foreground or _window_pid(foreground) != pid:
+            return False
+        hwnd = wintypes.HWND(foreground)
+        style = _user32.GetWindowLongW(hwnd, GWL_STYLE)
+        if not style or style & WS_CAPTION == WS_CAPTION:
+            return False
+
+        monitor = _user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL)
+        overlay_monitor = _user32.MonitorFromWindow(
+            wintypes.HWND(overlay_hwnd), MONITOR_DEFAULTTONULL)
+        if not monitor or monitor != overlay_monitor:
+            return False
+        info = _MonitorInfo(cbSize=ctypes.sizeof(_MonitorInfo))
+        rect = wintypes.RECT()
+        if not (_user32.GetMonitorInfoW(wintypes.HMONITOR(monitor), ctypes.byref(info))
+                and _user32.GetWindowRect(hwnd, ctypes.byref(rect))):
+            return False
+        bounds = info.rcMonitor
+        return ((rect.left, rect.top, rect.right, rect.bottom)
+                == (bounds.left, bounds.top, bounds.right, bounds.bottom))
 
     def close(self) -> None:
         self._stop.set()
